@@ -1,0 +1,102 @@
+name: Sync from Upstream
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/21st-dev/1code.git || true
+          git fetch upstream
+
+      - name: Sync main branch (preserve fork commits)
+        id: sync
+        run: |
+          git checkout main
+
+          UPSTREAM_BRANCH="upstream/main"
+
+          # Find where our fork diverged from upstream (our custom commits)
+          MERGE_BASE=$(git merge-base HEAD $UPSTREAM_BRANCH)
+
+          # Get list of our custom commits (commits after merge-base that are not in upstream)
+          CUSTOM_COMMITS=$(git log --reverse --format="%H" $MERGE_BASE..HEAD --not $UPSTREAM_BRANCH 2>/dev/null || echo "")
+
+          if [ -z "$CUSTOM_COMMITS" ]; then
+            echo "No custom commits to preserve"
+          else
+            echo "Custom commits to preserve:"
+            echo "$CUSTOM_COMMITS" | while read commit; do
+              git log --oneline -1 $commit
+            done
+          fi
+
+          # Check if upstream has new changes
+          UPSTREAM_COMMIT=$(git rev-parse $UPSTREAM_BRANCH)
+          LOCAL_BASE=$(git merge-base HEAD $UPSTREAM_BRANCH)
+
+          if [ "$LOCAL_BASE" = "$UPSTREAM_COMMIT" ]; then
+            echo "Already up to date with upstream"
+            echo "synced=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "New changes detected from upstream!"
+
+          # Strategy: Reset to upstream, then cherry-pick our custom commits on top
+          # This ensures our commits are ALWAYS on top of upstream
+
+          # Save current HEAD for safety
+          git branch backup-before-sync HEAD 2>/dev/null || true
+
+          # Reset to upstream
+          git reset --hard $UPSTREAM_BRANCH
+
+          # Re-apply our custom commits on top
+          if [ -n "$CUSTOM_COMMITS" ]; then
+            echo "Re-applying custom commits..."
+            echo "$CUSTOM_COMMITS" | while read commit; do
+              echo "Cherry-picking: $(git log --oneline -1 $commit)"
+              git cherry-pick $commit --strategy-option=theirs || {
+                echo "Conflict in $commit, keeping our version..."
+                git checkout --theirs . 2>/dev/null || true
+                git add -A
+                git cherry-pick --continue --no-edit || git commit --allow-empty -m "Re-applied fork changes"
+              }
+            done
+          fi
+
+          # Clean up backup branch
+          git branch -D backup-before-sync 2>/dev/null || true
+
+          git push origin HEAD --force-with-lease
+          echo "synced=true" >> $GITHUB_OUTPUT
+
+      - name: Trigger build workflow
+        if: steps.sync.outputs.synced == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'build-mac.yml',
+              ref: 'main'
+            })
