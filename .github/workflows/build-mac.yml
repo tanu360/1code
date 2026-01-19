@@ -1,0 +1,168 @@
+name: Build macOS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: "Architecture to build"
+        required: true
+        default: "arm64"
+        type: choice
+        options:
+          - arm64
+          - x64
+          - universal
+
+permissions:
+  contents: write
+
+jobs:
+  build-mac:
+    runs-on: macos-14
+
+    strategy:
+      matrix:
+        arch: ${{ github.event_name == 'workflow_dispatch' && fromJSON(format('["{0}"]', inputs.arch)) || fromJSON('["arm64"]') }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python (for node-gyp)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install setuptools (for distutils)
+        run: pip install setuptools
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+        env:
+          # Skip postinstall electron-rebuild - we'll do it with correct arch
+          SKIP_NATIVE_REBUILD: true
+
+      - name: Rebuild native modules for target architecture
+        run: |
+          # Set target architecture for electron-rebuild
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            export npm_config_arch=arm64
+            export npm_config_target_arch=arm64
+          else
+            export npm_config_arch=x64
+            export npm_config_target_arch=x64
+          fi
+
+          # Get Electron version
+          ELECTRON_VERSION=$(node -p "require('./package.json').devDependencies.electron.replace('^', '')")
+
+          # Rebuild native modules for target architecture
+          npx electron-rebuild -f -w better-sqlite3,node-pty --arch=${{ matrix.arch }} --electron-version=$ELECTRON_VERSION
+
+          # Verify the architecture
+          echo "Verifying better-sqlite3 architecture..."
+          file node_modules/better-sqlite3/build/Release/better_sqlite3.node || true
+
+      - name: Download Claude binary for target architecture
+        run: |
+          # Download Claude binary for the specific target architecture
+          node scripts/download-claude-binary.mjs --platform=darwin-${{ matrix.arch }}
+        env:
+          # If the script doesn't support --platform, download for current platform
+          # The extraResources config will handle platform-specific binaries
+          FORCE_PLATFORM: darwin-${{ matrix.arch }}
+
+      - name: Ensure Claude binary exists for target arch
+        run: |
+          TARGET_DIR="resources/bin/darwin-${{ matrix.arch }}"
+          if [ ! -d "$TARGET_DIR" ] || [ -z "$(ls -A $TARGET_DIR 2>/dev/null)" ]; then
+            echo "Claude binary not found for darwin-${{ matrix.arch }}, downloading..."
+            # Fallback: download for current platform and copy if needed
+            bun run claude:download
+
+            # If we're on arm64 runner building for x64 (or vice versa), we need the correct binary
+            CURRENT_ARCH=$(uname -m)
+            if [ "$CURRENT_ARCH" = "arm64" ] && [ "${{ matrix.arch }}" = "x64" ]; then
+              echo "Cross-compiling: need x64 binary on arm64 runner"
+              # Download x64 binary specifically
+              mkdir -p resources/bin/darwin-x64
+              curl -L "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/$(cat resources/bin/VERSION | head -1)/darwin-x64/claude" -o resources/bin/darwin-x64/claude
+              chmod +x resources/bin/darwin-x64/claude
+            elif [ "$CURRENT_ARCH" = "x86_64" ] && [ "${{ matrix.arch }}" = "arm64" ]; then
+              echo "Cross-compiling: need arm64 binary on x64 runner"
+              mkdir -p resources/bin/darwin-arm64
+              curl -L "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/$(cat resources/bin/VERSION | head -1)/darwin-arm64/claude" -o resources/bin/darwin-arm64/claude
+              chmod +x resources/bin/darwin-arm64/claude
+            fi
+          fi
+
+          echo "Claude binary directory contents:"
+          ls -la resources/bin/ || true
+          ls -la resources/bin/darwin-${{ matrix.arch }}/ || true
+
+      - name: Build application
+        run: bun run build
+
+      - name: Package for macOS
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+          SKIP_NOTARIZATION: true
+          APPLE_IDENTITY: "-"
+        run: |
+          # Build only for the target architecture using explicit target syntax
+          # Format: --mac dmg:arch zip:arch
+          npx electron-builder --mac dmg:${{ matrix.arch }} zip:${{ matrix.arch }} \
+            --config.mac.identity=null \
+            --config.mac.notarize=false
+
+      - name: Get version
+        id: version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "date=$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
+          ls -la release/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}-${{ steps.version.outputs.date }}
+          name: "1Code v${{ steps.version.outputs.version }} (Build ${{ steps.version.outputs.date }})"
+          body: |
+            ## 1Code macOS Build
+
+            **Version:** ${{ steps.version.outputs.version }}
+            **Architecture:** ${{ matrix.arch }}
+            **Build Date:** ${{ steps.version.outputs.date }}
+
+            ### Downloads
+            - `.dmg` - Disk Image (recommended)
+            - `.zip` - Zipped App
+
+            ### Installation
+            1. Copy the app to `/Applications` folder
+            2. Open Terminal and run:
+               ```
+               xattr -dr com.apple.quarantine /Applications/1Code.app
+               ```
+            3. Open the app normally
+          draft: false
+          prerelease: false
+          files: |
+            release/1Code-${{ steps.version.outputs.version }}-${{ matrix.arch }}.dmg
+            release/1Code-${{ steps.version.outputs.version }}-${{ matrix.arch }}.zip
+
+      - name: Upload artifacts (backup)
+        uses: actions/upload-artifact@v4
+        with:
+          name: 1Code-mac-${{ matrix.arch }}-all
+          path: |
+            release/1Code-${{ steps.version.outputs.version }}-${{ matrix.arch }}.*
+          if-no-files-found: warn
