@@ -5,8 +5,10 @@
  * Usage:
  *   node scripts/download-claude-binary.mjs                          # Download for current platform
  *   node scripts/download-claude-binary.mjs --all                    # Download all platforms
- *   node scripts/download-claude-binary.mjs --platform darwin-x64    # Download for specific platform
+ *   node scripts/download-claude-binary.mjs --platform=darwin-arm64  # Download for specific platform
  *   node scripts/download-claude-binary.mjs --version=2.1.5          # Specific version
+ *
+ * Supported platforms: darwin-arm64, darwin-x64, linux-arm64, linux-x64, win32-x64
  */
 
 import fs from "node:fs"
@@ -220,13 +222,8 @@ async function main() {
   const downloadAll = args.includes("--all")
   const versionArg = args.find((a) => a.startsWith("--version="))
   const specifiedVersion = versionArg?.split("=")[1]
-  const platformArgIdx = args.indexOf("--platform")
-  const platformArgEq = args.find((a) => a.startsWith("--platform="))
-  const specifiedPlatform = platformArgEq
-    ? platformArgEq.split("=")[1]
-    : platformArgIdx >= 0
-      ? args[platformArgIdx + 1]
-      : null
+  const platformArg = args.find((a) => a.startsWith("--platform="))
+  const specifiedPlatform = platformArg?.split("=")[1] || process.env.FORCE_PLATFORM
 
   console.log("Claude Code Binary Downloader")
   console.log("=============================\n")
@@ -252,7 +249,7 @@ async function main() {
   if (downloadAll) {
     platformsToDownload = Object.keys(PLATFORMS)
   } else if (specifiedPlatform) {
-    // Specific platform requested via --platform
+    // Specific platform requested (e.g., --platform=darwin-arm64)
     if (!PLATFORMS[specifiedPlatform]) {
       console.error(`Unsupported platform: ${specifiedPlatform}`)
       console.log(`Supported platforms: ${Object.keys(PLATFORMS).join(", ")}`)
